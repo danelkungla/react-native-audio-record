@@ -31,10 +31,13 @@ public class RNAudioRecordModule extends ReactContextBaseJavaModule {
     private AudioRecord recorder;
     private int bufferSize;
     private boolean isRecording;
+    private boolean isPaused;
 
     private String tmpFile;
     private String outFile;
     private Promise stopRecordingPromise;
+    private final Object pauseLock = new Object();
+    private Thread recordingThread;
 
 
     public RNAudioRecordModule(ReactApplicationContext reactContext) {
@@ -82,6 +85,7 @@ public class RNAudioRecordModule extends ReactContextBaseJavaModule {
         }
 
         isRecording = false;
+        isPaused = false;
         eventEmitter = reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class);
 
         bufferSize = AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat);
@@ -90,52 +94,90 @@ public class RNAudioRecordModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
-    public void pause() {
-        isRecording = false;
-        recorder.stop();
-        Log.d(TAG, "paused recording");
+    public void pause(Promise promise) {
+        if (!isRecording || isPaused) { promise.resolve(null); return; }
+        isPaused = true;
+        promise.resolve(null);
     }
     
     @ReactMethod
-    public void resume() {
-        isRecording = true;
-        recorder.startRecording();
-        Log.d(TAG, "resumed recording");
+    public void resume(Promise promise) {
+        if (!isRecording || !isPaused) { promise.resolve(null); return; }
+        isPaused = false;
+        synchronized (pauseLock) { pauseLock.notifyAll(); }
+        promise.resolve(null);
     }
 
     @ReactMethod
     public void start() {
+        if (recordingThread != null) return;
+
         isRecording = true;
+        isPaused = false;
+
         recorder.startRecording();
         Log.d(TAG, "started recording");
 
-        Thread recordingThread = new Thread(new Runnable() {
-            public void run() {
-                try {
-                    int bytesRead;
-                    int count = 0;
-                    String base64Data;
-                    byte[] buffer = new byte[bufferSize];
-                    FileOutputStream os = new FileOutputStream(tmpFile);
+        recordingThread = new Thread(() -> {
+            try {
+                int bytesRead;
+                int count = 0;
+                String base64Data;
+                byte[] buffer = new byte[bufferSize];
 
-                    while (isRecording) {
-                        bytesRead = recorder.read(buffer, 0, buffer.length);
+                FileOutputStream os = new FileOutputStream(tmpFile);
 
-                        // skip first 2 buffers to eliminate "click sound"
-                        if (bytesRead > 0 && ++count > 2) {
-                            base64Data = Base64.encodeToString(buffer, Base64.NO_WRAP);
-                            eventEmitter.emit("data", base64Data);
-                            os.write(buffer, 0, bytesRead);
+                while (isRecording) {
+                    // Handle pause
+                    if (isPaused) {
+                        // Stop AudioRecord only once when entering pause
+                        if (recorder.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                            recorder.stop();
                         }
+                        // Park the thread without burning CPU
+                        synchronized (pauseLock) {
+                            while (isPaused && isRecording) pauseLock.wait();
+                        }
+                        // If we were told to stop while paused, break out
+                        if (!isRecording) break;
+
+                        // Resume native recorder
+                        recorder.startRecording();
+
+                        // Skip a couple of buffers after resume to avoid clicks
+                        count = 0;
+                        continue;
                     }
 
-                    recorder.stop();
-                    os.close();
-                    saveAsWav();
-                    stopRecordingPromise.resolve(outFile);
-                } catch (Exception e) {
-                    e.printStackTrace();
+                    // Normal read
+                    bytesRead = recorder.read(buffer, 0, buffer.length);
+
+                    // skip first 2 buffers to eliminate "click sound"
+                    if (bytesRead > 0 && ++count > 2) {
+                        base64Data = Base64.encodeToString(buffer, Base64.NO_WRAP);
+                        eventEmitter.emit("data", base64Data);
+                        os.write(buffer, 0, bytesRead);
+                    }
                 }
+
+                // Finalize stop
+                if (recorder.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                    recorder.stop();
+                }
+                os.close();
+                saveAsWav(); // writes header using tmpFile length -> outFile
+                if (stopRecordingPromise != null) {
+                    stopRecordingPromise.resolve(outFile);
+                    stopRecordingPromise = null;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                if (stopRecordingPromise != null) {
+                    stopRecordingPromise.reject("E_RECORD", e);
+                    stopRecordingPromise = null;
+                }
+            } finally {
+                recordingThread = null;
             }
         });
 
@@ -144,8 +186,10 @@ public class RNAudioRecordModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void stop(Promise promise) {
-        isRecording = false;
-        stopRecordingPromise = promise;
+    stopRecordingPromise = promise;
+    isRecording = false;
+
+    synchronized (pauseLock) { isPaused = false; pauseLock.notifyAll(); }
     }
 
     private void saveAsWav() {
