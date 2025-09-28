@@ -90,6 +90,20 @@ public class RNAudioRecordModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void pause() {
+        isRecording = false;
+        recorder.stop();
+        Log.d(TAG, "paused recording");
+    
+    
+    @ReactMethod
+    public void resume() {
+        isRecording = true;
+        recorder.startRecording();
+        Log.d(TAG, "resumed recording");
+    }
+
+    @ReactMethod
     public void start() {
         isRecording = true;
         recorder.startRecording();
